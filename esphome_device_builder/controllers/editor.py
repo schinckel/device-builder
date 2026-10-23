@@ -248,15 +248,19 @@ class EditorController:
 
     @api_command("editor/list_packages")
     async def list_packages(self, **_kwargs: Any) -> list[str]:
-        """List YAML files available under packages/."""
-        root = self._package_root()
+        """List reusable YAML files in the ESPHome config directory."""
+        root = Path(self._db.settings.config_dir).resolve()
+        device_configs = self._device_configurations()
         return await asyncio.to_thread(
             lambda: sorted(
-                path.relative_to(Path(self._db.settings.config_dir).resolve()).as_posix()
+                relative
                 for path in root.rglob("*")
                 if path.is_file()
                 and path.suffix.lower() in {".yaml", ".yml"}
                 and path.resolve().is_relative_to(root)
+                and not any(part.startswith(".") for part in path.relative_to(root).parts)
+                and (relative := path.relative_to(root).as_posix()) not in device_configs
+                and relative.lower() != "secrets.yaml"
             )
         )
 
@@ -268,16 +272,43 @@ class EditorController:
         return await asyncio.to_thread(self._devices_using_package, relative)
 
     def _package_path(self, path: str) -> Path:
-        """Resolve a package path while keeping it inside config/packages."""
+        """Resolve a reusable YAML path while keeping it inside the config directory."""
         if not isinstance(path, str) or not path.strip():
             raise CommandError(ErrorCode.INVALID_ARGS, "path must be a non-empty string")
-        root = self._package_root()
-        candidate = (root / path.removeprefix("packages/")).resolve()
-        if not candidate.is_relative_to(root) or candidate.suffix.lower() not in {".yaml", ".yml"}:
+        root = Path(self._db.settings.config_dir).resolve()
+        relative = path.removeprefix("/config/esphome/")
+        candidate = (root / relative).resolve()
+        normalized = (
+            candidate.relative_to(root).as_posix() if candidate.is_relative_to(root) else ""
+        )
+        if (
+            not candidate.is_relative_to(root)
+            or candidate.suffix.lower() not in {".yaml", ".yml"}
+            or normalized in self._device_configurations()
+            or normalized.lower() == "secrets.yaml"
+        ):
             raise CommandError(
-                ErrorCode.INVALID_ARGS, "Package path must be a YAML file inside packages/"
+                ErrorCode.INVALID_ARGS,
+                "Package path must be a reusable YAML file inside the config directory",
             )
         return candidate
+
+    def _device_configurations(self) -> set[str]:
+        """Return loaded device YAML paths so they aren't offered as reusable files."""
+        devices = getattr(self._db, "devices", None)
+        get_devices = getattr(devices, "get_devices", None)
+        if not callable(get_devices):
+            return set()
+        try:
+            return {
+                configuration
+                for device in get_devices()
+                if isinstance((configuration := getattr(device, "configuration", None)), str)
+            }
+        except TypeError:
+            # Lightweight controller tests and startup before the device store
+            # is ready may not have an iterable device snapshot yet.
+            return set()
 
     def _package_root(self) -> Path:
         """Resolve packages/ while keeping its target inside the config directory."""
@@ -302,7 +333,6 @@ class EditorController:
     ) -> list[str]:
         """Find local package !include references recursively."""
         root = Path(self._db.settings.config_dir).resolve()
-        package_root = self._package_root()
         try:
             source = source.resolve()
             if source in seen or not source.is_relative_to(root):
@@ -315,7 +345,7 @@ class EditorController:
         found: list[str] = []
         for ref in refs:
             target = (source.parent / ref).resolve()
-            if not target.is_relative_to(package_root) or target.suffix.lower() not in {
+            if not target.is_relative_to(root) or target.suffix.lower() not in {
                 ".yaml",
                 ".yml",
             }:
@@ -334,17 +364,13 @@ class EditorController:
     def _devices_using_package(self, package: str) -> list[str]:
         """Find device YAMLs whose local package dependency graph contains *package*."""
         root = Path(self._db.settings.config_dir).resolve()
-        package_root = self._package_root()
         matches = []
-        for candidate in root.rglob("*"):
-            if (
-                not candidate.is_file()
-                or candidate.suffix.lower() not in {".yaml", ".yml"}
-                or candidate.is_relative_to(package_root)
-            ):
+        for configuration in self._device_configurations():
+            candidate = (root / configuration).resolve()
+            if not candidate.is_relative_to(root) or not candidate.is_file():
                 continue
             if package in self._packages_for_file(candidate, set()):
-                matches.append(candidate.relative_to(root).as_posix())
+                matches.append(configuration)
         return sorted(matches)
 
     # ------------------------------------------------------------------

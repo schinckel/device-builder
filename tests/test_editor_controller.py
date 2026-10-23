@@ -33,6 +33,7 @@ import contextlib
 import time
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1692,6 +1693,10 @@ def test_packages_for_file_follows_only_package_scoped_includes(tmp_path: Path) 
 def test_devices_using_package_finds_transitive_dependents(tmp_path: Path) -> None:
     """A device depending on a nested package is reported as a dependent."""
     controller = _make_controller(tmp_path)
+    controller._db.devices.get_devices.return_value = [
+        SimpleNamespace(configuration="lamp.yaml"),
+        SimpleNamespace(configuration="other.yaml"),
+    ]
     package_dir = tmp_path / "packages"
     package_dir.mkdir()
     (package_dir / "base.yaml").write_text(
@@ -1727,3 +1732,66 @@ def test_package_path_rejects_traversal_outside_packages(tmp_path: Path) -> None
 
     with pytest.raises(editor_module.CommandError):
         controller._package_path("../outside.yaml")
+
+
+@pytest.mark.asyncio
+async def test_list_packages_includes_shared_yaml_from_all_config_folders(tmp_path: Path) -> None:
+    controller = _make_controller(tmp_path)
+    controller._db.devices.get_devices.return_value = [SimpleNamespace(configuration="lamp.yaml")]
+    for relative in (
+        "packages/base.yaml",
+        "modules/wifi.yaml",
+        "sensors/temperature.yml",
+        "includes/common.yaml",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("logger:\n", encoding="utf-8")
+    (tmp_path / "lamp.yaml").write_text("esphome:\n  name: lamp\n", encoding="utf-8")
+    (tmp_path / "secrets.yaml").write_text("wifi_password: x\n", encoding="utf-8")
+    hidden = tmp_path / ".internal" / "hidden.yaml"
+    hidden.parent.mkdir()
+    hidden.write_text("logger:\n", encoding="utf-8")
+
+    assert await controller.list_packages() == [
+        "includes/common.yaml",
+        "modules/wifi.yaml",
+        "packages/base.yaml",
+        "sensors/temperature.yml",
+    ]
+
+
+def test_package_path_accepts_modules_and_sensors_but_rejects_device_configs(
+    tmp_path: Path,
+) -> None:
+    controller = _make_controller(tmp_path)
+    controller._db.devices.get_devices.return_value = [SimpleNamespace(configuration="lamp.yaml")]
+
+    assert controller._package_path("modules/wifi.yaml") == tmp_path / "modules/wifi.yaml"
+    assert controller._package_path("sensors/temperature.yml") == (
+        tmp_path / "sensors/temperature.yml"
+    )
+    with pytest.raises(editor_module.CommandError):
+        controller._package_path("lamp.yaml")
+    with pytest.raises(editor_module.CommandError):
+        controller._package_path("packages/../lamp.yaml")
+
+
+def test_package_include_discovery_accepts_relative_yaml_outside_packages(
+    tmp_path: Path,
+) -> None:
+    controller = _make_controller(tmp_path)
+    package_dir = tmp_path / "packages"
+    package_dir.mkdir()
+    (tmp_path / "modules").mkdir()
+    (package_dir / "base.yaml").write_text(
+        "packages:\n  wifi: !include ../modules/wifi.yaml\n", encoding="utf-8"
+    )
+    (tmp_path / "modules" / "wifi.yaml").write_text("wifi:\n", encoding="utf-8")
+    config = tmp_path / "lamp.yaml"
+    config.write_text("packages:\n  base: !include packages/base.yaml\n", encoding="utf-8")
+
+    assert controller._packages_for_file(config, set()) == [
+        "packages/base.yaml",
+        "modules/wifi.yaml",
+    ]

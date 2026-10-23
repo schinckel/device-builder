@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from fnv_hash_fast import fnv1a_32
 
-from ..helpers.api import api_command
+from ..helpers.api import CommandError, api_command
 from ..helpers.async_ import drain_tasks, run_in_executor
 from ..helpers.device_yaml import extract_component_source_fingerprint
 from ..helpers.json import JSONDecodeError, dumps, loads
@@ -24,6 +25,7 @@ from ..helpers.migrations import render_migrations
 from ..helpers.process import kill_quietly
 from ..helpers.sibling_cli import find_esphome_cmd
 from ..helpers.subprocess import create_subprocess_exec
+from ..models import ErrorCode
 from ..models.automations import MigrateConfigResponse
 
 if TYPE_CHECKING:
@@ -57,6 +59,33 @@ _STALE_SOURCES = "stale"
 
 # A validation result is one JSON line; this bounds the largest line readline accepts.
 _STDOUT_LINE_LIMIT = 4 * 1024 * 1024
+
+
+def _package_include_refs(lines: list[str], *, package_map: bool) -> tuple[list[str], set[str]]:
+    """Return package includes and the paths that contain an included package map."""
+    refs: list[str] = []
+    package_maps: set[str] = set()
+    if package_map:
+        for line in lines:
+            match = re.match(r"^[^#\s][^:]*:\s*!include\s+['\"]?([^\s'\"]+)", line)
+            if match:
+                refs.append(match.group(1))
+    for index, line in enumerate(lines):
+        header = re.match(r"^packages\s*:\s*(.*)$", line)
+        if header is None:
+            continue
+        root_include = re.search(r"!include\s+['\"]?([^\s'\"]+)", header.group(1))
+        if root_include:
+            refs.append(root_include.group(1))
+            package_maps.add(root_include.group(1))
+            continue
+        for entry in lines[index + 1 :]:
+            if entry and not entry[0].isspace() and not entry.lstrip().startswith("#"):
+                break
+            match = re.match(r"^\s+[^#\s][^:]*:\s*!include\s+['\"]?([^\s'\"]+)", entry)
+            if match:
+                refs.append(match.group(1))
+    return refs, package_maps
 
 
 class ValidatorUnavailableError(RuntimeError):
@@ -157,6 +186,166 @@ class EditorController:
             session.invalidation_epoch += 1
             if session.source_fingerprint:
                 session.source_fingerprint = _STALE_SOURCES
+
+    @api_command("editor/get_package")
+    async def get_package(self, *, path: str, **_kwargs: Any) -> str:
+        """Read a package YAML file; missing package files open as empty drafts."""
+        package = self._package_path(path)
+        try:
+            return await asyncio.to_thread(package.read_text, encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+
+    @api_command("editor/save_package")
+    async def save_package(self, *, path: str, content: str, **_kwargs: Any) -> dict[str, Any]:
+        """Save a package YAML file and validate every device that depends on it."""
+        if not isinstance(content, str):
+            raise CommandError(ErrorCode.INVALID_ARGS, "content must be a string")
+        package = self._package_path(path)
+        relative = package.relative_to(Path(self._db.settings.config_dir).resolve()).as_posix()
+        devices = self._db.devices
+        assert devices is not None
+        async with devices._yaml_write_lock(relative):
+            await asyncio.to_thread(package.parent.mkdir, parents=True, exist_ok=True)
+            await devices._write_yaml_atomic_async(package, content)
+            await devices._commit_history(relative, f"Edit {relative}")
+        self._db.invalidate_editor_cache()
+        affected = await asyncio.to_thread(self._devices_using_package, relative)
+        for configuration in affected:
+            devices._after_yaml_write(configuration)
+        results = []
+        for configuration in affected:
+            try:
+                yaml = await asyncio.to_thread(
+                    (Path(self._db.settings.config_dir) / configuration).read_text,
+                    encoding="utf-8",
+                )
+                verdict = await self.validate_yaml(configuration=configuration, content=yaml)
+                errors = verdict.get("yaml_errors", []) + verdict.get("validation_errors", [])
+                results.append(
+                    {"configuration": configuration, "valid": not errors, "errors": errors}
+                )
+            except (
+                OSError,
+                UnicodeDecodeError,
+                ValidatorTimeoutError,
+                ValidatorUnavailableError,
+            ) as err:
+                results.append(
+                    {
+                        "configuration": configuration,
+                        "valid": False,
+                        "errors": [{"message": str(err)}],
+                    }
+                )
+        return {"path": relative, "results": results}
+
+    @api_command("editor/list_device_packages")
+    async def list_device_packages(self, *, configuration: str, **_kwargs: Any) -> list[str]:
+        """List local package files referenced by one device YAML."""
+        cfg = self._config_path(configuration)
+        return await asyncio.to_thread(self._packages_for_file, cfg, set())
+
+    @api_command("editor/list_packages")
+    async def list_packages(self, **_kwargs: Any) -> list[str]:
+        """List YAML files available under packages/."""
+        root = self._package_root()
+        return await asyncio.to_thread(
+            lambda: sorted(
+                path.relative_to(Path(self._db.settings.config_dir).resolve()).as_posix()
+                for path in root.rglob("*")
+                if path.is_file()
+                and path.suffix.lower() in {".yaml", ".yml"}
+                and path.resolve().is_relative_to(root)
+            )
+        )
+
+    @api_command("editor/list_package_devices")
+    async def list_package_devices(self, *, path: str, **_kwargs: Any) -> list[str]:
+        """List device YAML files that use a package, directly or transitively."""
+        package = self._package_path(path)
+        relative = package.relative_to(Path(self._db.settings.config_dir).resolve()).as_posix()
+        return await asyncio.to_thread(self._devices_using_package, relative)
+
+    def _package_path(self, path: str) -> Path:
+        """Resolve a package path while keeping it inside config/packages."""
+        if not isinstance(path, str) or not path.strip():
+            raise CommandError(ErrorCode.INVALID_ARGS, "path must be a non-empty string")
+        root = self._package_root()
+        candidate = (root / path.removeprefix("packages/")).resolve()
+        if not candidate.is_relative_to(root) or candidate.suffix.lower() not in {".yaml", ".yml"}:
+            raise CommandError(
+                ErrorCode.INVALID_ARGS, "Package path must be a YAML file inside packages/"
+            )
+        return candidate
+
+    def _package_root(self) -> Path:
+        """Resolve packages/ while keeping its target inside the config directory."""
+        root = Path(self._db.settings.config_dir).resolve()
+        package_root = (root / "packages").resolve()
+        if not package_root.is_relative_to(root):
+            raise CommandError(
+                ErrorCode.INVALID_ARGS, "packages/ must stay inside the config directory"
+            )
+        return package_root
+
+    def _config_path(self, configuration: str) -> Path:
+        """Resolve a device config path within the ESPHome config directory."""
+        root = Path(self._db.settings.config_dir).resolve()
+        candidate = (root / configuration).resolve()
+        if not candidate.is_relative_to(root):
+            raise CommandError(ErrorCode.INVALID_ARGS, "configuration escapes the config directory")
+        return candidate
+
+    def _packages_for_file(
+        self, source: Path, seen: set[Path], *, package_map: bool = False
+    ) -> list[str]:
+        """Find local package !include references recursively."""
+        root = Path(self._db.settings.config_dir).resolve()
+        package_root = self._package_root()
+        try:
+            source = source.resolve()
+            if source in seen or not source.is_relative_to(root):
+                return []
+            seen.add(source)
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return []
+        refs, package_maps = _package_include_refs(text.splitlines(), package_map=package_map)
+        found: list[str] = []
+        for ref in refs:
+            target = (source.parent / ref).resolve()
+            if not target.is_relative_to(package_root) or target.suffix.lower() not in {
+                ".yaml",
+                ".yml",
+            }:
+                continue
+            rel = target.relative_to(root).as_posix()
+            if rel not in found:
+                found.append(rel)
+            is_package_map = ref in package_maps
+            found.extend(
+                x
+                for x in self._packages_for_file(target, seen, package_map=is_package_map)
+                if x not in found
+            )
+        return found
+
+    def _devices_using_package(self, package: str) -> list[str]:
+        """Find device YAMLs whose local package dependency graph contains *package*."""
+        root = Path(self._db.settings.config_dir).resolve()
+        package_root = self._package_root()
+        matches = []
+        for candidate in root.rglob("*"):
+            if (
+                not candidate.is_file()
+                or candidate.suffix.lower() not in {".yaml", ".yml"}
+                or candidate.is_relative_to(package_root)
+            ):
+                continue
+            if package in self._packages_for_file(candidate, set()):
+                matches.append(candidate.relative_to(root).as_posix())
+        return sorted(matches)
 
     # ------------------------------------------------------------------
     # Subprocess management

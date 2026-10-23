@@ -1665,3 +1665,65 @@ async def test_migrate_config_applies_generated_rules(
     diff = result["yaml_diff"]
     assert diff is not None
     assert "voc_index:" in diff["replacement"]
+
+
+def test_packages_for_file_follows_only_package_scoped_includes(tmp_path: Path) -> None:
+    """Package dependency discovery ignores unrelated !include directives."""
+    controller = _make_controller(tmp_path)
+    package_dir = tmp_path / "packages"
+    (package_dir / "nested").mkdir(parents=True)
+    (package_dir / "base.yaml").write_text(
+        "packages:\n  shared: !include nested/shared.yaml\n", encoding="utf-8"
+    )
+    (package_dir / "nested" / "shared.yaml").write_text("logger:\n", encoding="utf-8")
+    config = tmp_path / "lamp.yaml"
+    config.write_text(
+        "packages:\n  base: !include packages/base.yaml\n"
+        "external_components:\n  - source: !include packages/ignored.yaml\n",
+        encoding="utf-8",
+    )
+
+    assert controller._packages_for_file(config, set()) == [
+        "packages/base.yaml",
+        "packages/nested/shared.yaml",
+    ]
+
+
+def test_devices_using_package_finds_transitive_dependents(tmp_path: Path) -> None:
+    """A device depending on a nested package is reported as a dependent."""
+    controller = _make_controller(tmp_path)
+    package_dir = tmp_path / "packages"
+    package_dir.mkdir()
+    (package_dir / "base.yaml").write_text(
+        "packages:\n  shared: !include shared.yaml\n", encoding="utf-8"
+    )
+    (package_dir / "shared.yaml").write_text("logger:\n", encoding="utf-8")
+    (tmp_path / "lamp.yaml").write_text(
+        "packages:\n  base: !include packages/base.yaml\n", encoding="utf-8"
+    )
+    (tmp_path / "other.yaml").write_text("logger:\n", encoding="utf-8")
+
+    assert controller._devices_using_package("packages/shared.yaml") == ["lamp.yaml"]
+
+
+def test_packages_for_file_supports_included_package_map(tmp_path: Path) -> None:
+    """A packages map included as a whole is traversed for its package refs."""
+    controller = _make_controller(tmp_path)
+    package_dir = tmp_path / "packages"
+    package_dir.mkdir()
+    (package_dir / "map.yaml").write_text("base: !include base.yaml\n", encoding="utf-8")
+    (package_dir / "base.yaml").write_text("logger:\n", encoding="utf-8")
+    config = tmp_path / "lamp.yaml"
+    config.write_text("packages: !include packages/map.yaml\n", encoding="utf-8")
+
+    assert controller._packages_for_file(config, set()) == [
+        "packages/map.yaml",
+        "packages/base.yaml",
+    ]
+
+
+def test_package_path_rejects_traversal_outside_packages(tmp_path: Path) -> None:
+    controller = _make_controller(tmp_path)
+
+    with pytest.raises(editor_module.CommandError):
+        controller._package_path("../outside.yaml")
